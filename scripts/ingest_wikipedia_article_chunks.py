@@ -14,6 +14,7 @@ import json
 import os
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -63,10 +64,67 @@ def clean_wikitext(text: str) -> str:
     return text.strip()
 
 
-def create_chunks(text: str, chunk_size: int = 200, overlap: int = 100) -> List[Tuple[int, int]]:
+def extract_sections(text: str) -> List[Tuple[int, str]]:
+    """
+    Extract section headers and their character positions from cleaned text.
+    
+    Args:
+        text: Cleaned text (should still have section markers)
+        
+    Returns:
+        List of (position, section_name) tuples sorted by position
+    """
+    sections = [(0, "Introduction")]  # Default section at start
+    
+    # Find section headers (assumes they start at beginning of line)
+    # Common patterns: "Section Name" after cleaning removes == markers
+    # We'll look for lines that look like headers (short, capitalized)
+    lines = text.split('\n')
+    char_pos = 0
+    
+    for line in lines:
+        line_stripped = line.strip()
+        # Heuristic: section headers are typically short (< 100 chars), 
+        # start with capital, and don't end with punctuation
+        if (line_stripped and 
+            len(line_stripped) < 100 and 
+            line_stripped[0].isupper() and 
+            not line_stripped[-1] in '.!?,;:' and
+            len(line_stripped.split()) <= 8):  # Not too many words
+            sections.append((char_pos, line_stripped))
+        
+        char_pos += len(line) + 1  # +1 for newline
+    
+    return sections
+
+
+def get_section_for_position(sections: List[Tuple[int, str]], position: int) -> str:
+    """
+    Get the section name for a given character position.
+    
+    Args:
+        sections: List of (position, section_name) tuples
+        position: Character position in text
+        
+    Returns:
+        Section name that contains this position
+    """
+    current_section = "Introduction"
+    
+    for section_pos, section_name in sections:
+        if position >= section_pos:
+            current_section = section_name
+        else:
+            break
+    
+    return current_section
+
+
+def create_chunks(text: str, chunk_size: int = 200, overlap: int = 100) -> List[Tuple[int, int, str]]:
     """
     Create overlapping chunks from text based on word boundaries.
     Uses actual character positions from original text to enable exact reconstruction.
+    Also tracks section context for each chunk.
     
     Args:
         text: Input text (will preserve exact whitespace)
@@ -74,11 +132,13 @@ def create_chunks(text: str, chunk_size: int = 200, overlap: int = 100) -> List[
         overlap: Number of words to overlap between chunks
         
     Returns:
-        List of (start_char_index, end_char_index) tuples that can be used
-        to extract exact text via text[start:end]
+        List of (start_char_index, end_char_index, section_name) tuples
     """
     if not text:
         return []
+    
+    # Extract section headers and their positions
+    sections = extract_sections(text)
     
     # Find word boundaries in original text using regex
     # This preserves exact character positions
@@ -107,7 +167,10 @@ def create_chunks(text: str, chunk_size: int = 200, overlap: int = 100) -> List[
         start_char = chunk_words[0][0]  # Start of first word
         end_char = chunk_words[-1][1]   # End of last word
         
-        chunks.append((start_char, end_char))
+        # Determine which section this chunk belongs to
+        section = get_section_for_position(sections, start_char)
+        
+        chunks.append((start_char, end_char, section))
         
         # Advance by step
         i += step
@@ -277,7 +340,7 @@ def generate_embedding(
     text: str, 
     ollama_host: str = "http://localhost:11434", 
     model: str = "nomic-embed-text"
-) -> Optional[List[float]]:
+) -> Tuple[Optional[List[float]], float]:
     """
     Generate embedding for text using Ollama.
     
@@ -287,8 +350,9 @@ def generate_embedding(
         model: Embedding model name
         
     Returns:
-        Embedding vector or None on error
+        Tuple of (embedding vector or None on error, time taken in seconds)
     """
+    start_time = time.time()
     try:
         response = requests.post(
             f"{ollama_host}/api/embeddings",
@@ -296,9 +360,11 @@ def generate_embedding(
             timeout=30
         )
         response.raise_for_status()
-        return response.json()["embedding"]
+        elapsed = time.time() - start_time
+        return response.json()["embedding"], elapsed
     except Exception as e:
-        return None
+        elapsed = time.time() - start_time
+        return None, elapsed
 
 
 def insert_chunk(
@@ -311,7 +377,7 @@ def insert_chunk(
     embedding: List[float],
     source: str = 'wikipedia',
     commit: bool = False
-) -> bool:
+) -> Tuple[bool, float]:
     """
     Insert chunk with embedding into database.
     
@@ -327,8 +393,9 @@ def insert_chunk(
         commit: Whether to commit immediately
         
     Returns:
-        True if inserted successfully
+        Tuple of (True if inserted successfully, time taken in seconds)
     """
+    start_time = time.time()
     cursor = conn.cursor()
     
     insert_query = """
@@ -354,12 +421,14 @@ def insert_chunk(
         if commit:
             conn.commit()
         cursor.close()
-        return True
+        elapsed = time.time() - start_time
+        return True, elapsed
     except Exception as e:
         print(f"\n❌ Insert error for chunk {chunk_id}: {e}")
         conn.rollback()
         cursor.close()
-        return False
+        elapsed = time.time() - start_time
+        return False, elapsed
 
 
 def process_article(
@@ -368,8 +437,9 @@ def process_article(
     ollama_host: str,
     chunk_size: int,
     overlap: int,
-    model: str = "nomic-embed-text"
-) -> Tuple[int, int]:
+    model: str = "nomic-embed-text",
+    show_progress: bool = False
+) -> Tuple[int, int, Dict[str, List[float]]]:
     """
     Process single article into chunks.
     
@@ -380,9 +450,10 @@ def process_article(
         chunk_size: Words per chunk
         overlap: Overlap words
         model: Embedding model
+        show_progress: Show nested progress bar for chunks
         
     Returns:
-        Tuple of (chunks_generated, chunks_inserted)
+        Tuple of (chunks_generated, chunks_inserted, timing_stats)
     """
     # Check existing chunks
     existing_chunks = get_existing_chunks(db_url, article['id'])
@@ -394,39 +465,63 @@ def process_article(
     # Skip if all chunks already exist
     new_chunks = [i for i in range(len(chunk_boundaries)) if i not in existing_chunks]
     if not new_chunks:
-        return (0, 0)
+        return (0, 0, {'api_times': [], 'insert_times': [], 'validation_times': []})
     
     # Process new chunks
     conn = psycopg2.connect(db_url)
     generated = 0
     inserted = 0
     
-    for chunk_id in new_chunks:
-        start_char, end_char = chunk_boundaries[chunk_id]
+    # Timing statistics
+    api_times = []
+    insert_times = []
+    validation_times = []
+    
+    # Optional nested progress bar
+    chunk_iter = tqdm(new_chunks, desc=f"  Chunks", leave=False, disable=not show_progress)
+    
+    for chunk_id in chunk_iter:
+        start_char, end_char, section = chunk_boundaries[chunk_id]
         chunk_text = content[start_char:end_char]
         
         # VALIDATION: Verify chunk can be exactly reconstructed
+        val_start = time.time()
         try:
             validate_chunk_reconstruction(content, start_char, end_char)
+            validation_times.append(time.time() - val_start)
         except ValueError as e:
+            validation_times.append(time.time() - val_start)
             print(f"\n❌ Validation failed for article '{article['title']}' chunk {chunk_id}: {e}")
             print(f"   Skipping this chunk...")
             continue
         
-        # Generate embedding
-        embedding = generate_embedding(f"{article['title']}\n\n{chunk_text}", ollama_host, model)
+        # Prepend article title and section context for embedding
+        context = f"Article: {article['title']}\nSection: {section}\n\n"
+        text_with_context = context + chunk_text
+        
+        # Generate embedding with context
+        embedding, api_time = generate_embedding(text_with_context, ollama_host, model)
+        api_times.append(api_time)
         
         if embedding:
             generated += 1
             # Insert chunk
-            if insert_chunk(conn, article['id'], article['title'], chunk_id, start_char, end_char, embedding):
+            success, insert_time = insert_chunk(conn, article['id'], article['title'], chunk_id, start_char, end_char, embedding)
+            insert_times.append(insert_time)
+            if success:
                 inserted += 1
     
     # Final commit
     conn.commit()
     conn.close()
     
-    return (generated, inserted)
+    timing_stats = {
+        'api_times': api_times,
+        'insert_times': insert_times,
+        'validation_times': validation_times
+    }
+    
+    return (generated, inserted, timing_stats)
 
 
 def main() -> None:
@@ -479,6 +574,11 @@ def main() -> None:
         default="./data/questions/wikipedia_questions.json",
         help="Path to questions JSON file (prioritizes these articles)"
     )
+    parser.add_argument(
+        "--show-chunk-progress",
+        action="store_true",
+        help="Show nested progress bar for individual chunks"
+    )
     
     args = parser.parse_args()
     
@@ -524,24 +624,79 @@ def main() -> None:
     
     # Process articles
     print(f"\n2️⃣  Processing articles into chunks...")
+    print("   (Statistics update in progress bar)\n")
     
     total_generated = 0
     total_inserted = 0
     
-    for article in tqdm(articles, desc="Processing articles"):
-        generated, inserted = process_article(
+    # Aggregate timing statistics
+    all_api_times = []
+    all_insert_times = []
+    all_validation_times = []
+    
+    # Create progress bar with custom format
+    pbar = tqdm(articles, desc="Processing articles")
+    
+    for article in pbar:
+        generated, inserted, timing_stats = process_article(
             article,
             args.db_url,
             args.ollama_host,
             args.chunk_size,
             args.overlap,
-            args.embedding_model
+            args.embedding_model,
+            show_progress=args.show_chunk_progress
         )
         total_generated += generated
         total_inserted += inserted
+        
+        # Collect timing stats
+        all_api_times.extend(timing_stats['api_times'])
+        all_insert_times.extend(timing_stats['insert_times'])
+        all_validation_times.extend(timing_stats['validation_times'])
+        
+        # Update progress bar with current statistics
+        if all_api_times:
+            avg_api = sum(all_api_times) / len(all_api_times)
+            recent_api = sum(all_api_times[-10:]) / min(10, len(all_api_times)) if all_api_times else 0
+            max_api = max(all_api_times)
+            
+            avg_insert = sum(all_insert_times) / len(all_insert_times) if all_insert_times else 0
+            
+            postfix = {
+                'chunks': total_inserted,
+                'api_avg': f"{avg_api:.2f}s",
+                'api_recent': f"{recent_api:.2f}s",
+                'api_max': f"{max_api:.2f}s",
+                'db_avg': f"{avg_insert*1000:.1f}ms"
+            }
+            pbar.set_postfix(postfix)
     
     print(f"\n   ✓ Generated {total_generated} chunk embeddings")
     print(f"   ✓ Inserted {total_inserted} chunks")
+    
+    # Display timing statistics
+    if all_api_times:
+        print(f"\n📊 Timing Statistics:")
+        avg_api = sum(all_api_times) / len(all_api_times)
+        max_api = max(all_api_times)
+        min_api = min(all_api_times)
+        print(f"   • Ollama API calls: {len(all_api_times)} total")
+        print(f"     - Average: {avg_api:.3f}s")
+        print(f"     - Min: {min_api:.3f}s, Max: {max_api:.3f}s")
+    
+    if all_insert_times:
+        avg_insert = sum(all_insert_times) / len(all_insert_times)
+        max_insert = max(all_insert_times)
+        min_insert = min(all_insert_times)
+        print(f"   • Database inserts: {len(all_insert_times)} total")
+        print(f"     - Average: {avg_insert:.3f}s")
+        print(f"     - Min: {min_insert:.3f}s, Max: {max_insert:.3f}s")
+    
+    if all_validation_times:
+        avg_val = sum(all_validation_times) / len(all_validation_times)
+        print(f"   • Validation: {len(all_validation_times)} chunks")
+        print(f"     - Average: {avg_val:.4f}s")
     
     print(f"\n✅ Chunk ingestion complete!")
     print(f"\nQuery examples:")

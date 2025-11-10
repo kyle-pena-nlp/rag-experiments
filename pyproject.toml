@@ -27,6 +27,8 @@ generate-questions = "scripts.generate_questions:main"
 ingest-wikipedia = "scripts.ingest_wikipedia:main"
 ingest-wikipedia-article-chunks = "scripts.ingest_wikipedia_article_chunks:main"
 evaluate-retrieval = "scripts.evaluate_retrieval:main"
+evaluate-chunk-based-retrieval = "scripts.evaluate_chunk_based_retrieval:main"
+check-table-sizes = "scripts.check_table_sizes:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"
