@@ -25,6 +25,7 @@ compose-down = "scripts.compose_down:main"
 setup = "scripts.setup:main"
 generate-questions = "scripts.generate_questions:main"
 ingest-wikipedia = "scripts.ingest_wikipedia:main"
+ingest-wikipedia-article-chunks = "scripts.ingest_wikipedia_article_chunks:main"
 evaluate-retrieval = "scripts.evaluate_retrieval:main"
 
 [tool.poetry.group.dev.dependencies]

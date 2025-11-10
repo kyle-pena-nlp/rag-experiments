@@ -194,11 +194,16 @@ def compute_metrics(results: List[Dict], top_k: int) -> Dict:
     
     # Mean Reciprocal Rank (MRR)
     mrr_sum = 0
+    ranks = []
     for r in results:
         if r.get('source_rank'):
             mrr_sum += 1.0 / r['source_rank']
+            ranks.append(r['source_rank'])
     
     mrr = mrr_sum / total if total > 0 else 0
+    
+    # Average rank when found (conditional on source being found)
+    avg_rank_when_found = sum(ranks) / len(ranks) if ranks else None
     
     # Recall@K
     recall_at_k = found / total if total > 0 else 0
@@ -208,6 +213,7 @@ def compute_metrics(results: List[Dict], top_k: int) -> Dict:
         'source_found_count': found,
         'recall_at_k': recall_at_k,
         'mean_reciprocal_rank': mrr,
+        'average_rank_when_found': avg_rank_when_found,
         'top_k': top_k
     }
 
@@ -252,7 +258,7 @@ def main() -> None:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=5,
+        default=10,
         help="Number of articles to retrieve per question (default: 5)"
     )
     parser.add_argument(
@@ -328,6 +334,8 @@ def main() -> None:
     print(f"   • Source found: {metrics['source_found_count']}/{metrics['total_questions']}")
     print(f"   • Recall@{args.top_k}: {metrics['recall_at_k']:.2%}")
     print(f"   • Mean Reciprocal Rank: {metrics['mean_reciprocal_rank']:.3f}")
+    if metrics['average_rank_when_found'] is not None:
+        print(f"   • Average Rank (when found): {metrics['average_rank_when_found']:.2f}")
     
     # Save results
     print(f"\n5️⃣  Saving results...")
